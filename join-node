@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+
 set -euo pipefail
 
 CLUSTER_NAME="MainDC"
@@ -5,7 +7,9 @@ DC="DC1"
 RACK="RACK1"
 SEEDS="192.168.1.164,192.168.1.165"
 
-log() { echo "[$(date +%H:%M:%S)] $*"; }
+log() {
+    echo "[$(date +%H:%M:%S)] $*"
+}
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "Запускать от root"
@@ -13,59 +17,110 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 NODE_IP="${1:-}"
+
 if [ -z "$NODE_IP" ]; then
-    NODE_IP=$(ip -4 -o addr show scope global | grep -v docker | awk '{print $4}' | cut -d/ -f1 | head -1)
+    NODE_IP=$(
+        ip -4 -o addr show scope global |
+        grep -v docker |
+        awk '{print $4}' |
+        cut -d/ -f1 |
+        head -1
+    )
 fi
+
 if [ -z "$NODE_IP" ]; then
-    echo "Не удалось определить IP, передай его первым аргументом"
+    echo "Не удалось определить IP. Передай его первым аргументом:"
+    echo "Пример: $0 192.168.1.166"
     exit 1
 fi
+
 log "IP ноды: $NODE_IP"
 
+if ! ip -4 addr | grep -q "$NODE_IP"; then
+    echo "Ошибка: IP $NODE_IP не назначен этому серверу"
+    exit 1
+fi
+
 log "Отключаю swap"
-swapoff -a
-sed -i '/ swap / s/^/#/' /etc/fstab
+
+swapoff -a || true
+
+sed -i '/[[:space:]]swap[[:space:]]/ s/^/#/' /etc/fstab
 
 log "Настраиваю sysctl"
+
 tee /etc/sysctl.d/99-cassandra.conf > /dev/null <<'SYSCTL'
 vm.max_map_count = 1048575
 vm.swappiness = 1
 net.ipv4.tcp_keepalive_time = 300
 SYSCTL
+
 sysctl -p /etc/sysctl.d/99-cassandra.conf > /dev/null
 
 log "Настраиваю время"
+
 export DEBIAN_FRONTEND=noninteractive
+
 apt update -qq
+
 timedatectl set-timezone UTC
+
 apt install -y -qq systemd-timesyncd
+
 systemctl enable --now systemd-timesyncd
 
-log "Готовлю каталог данных"
-mkdir -p /opt/cassandra/data
-chown -R 999:999 /opt/cassandra/data
-
 if ! command -v docker &> /dev/null; then
+
     log "Устанавливаю Docker"
+
     apt install -y -qq ca-certificates curl gnupg
+
     install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+
+    curl -fsSL https://download.docker.com/linux/debian/gpg |
+        gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+
     chmod a+r /etc/apt/keyrings/docker.gpg
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" |
+        tee /etc/apt/sources.list.d/docker.list > /dev/null
+
     apt update -qq
+
     apt install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
+
     systemctl enable --now docker
+
 else
+
     log "Docker уже установлен"
+
 fi
 
+log "Готовлю каталог данных"
+
+mkdir -p /opt/cassandra/data
+
+chown -R 999:999 /opt/cassandra/data
+
 RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
-HEAP_MB=$(( RAM_MB / 4 ))
-[ $HEAP_MB -gt 8192 ] && HEAP_MB=8192
-HEAP_NEW_MB=$(( HEAP_MB / 5 ))
-log "RAM ${RAM_MB}M, heap ${HEAP_MB}M"
+
+HEAP_MB=$((RAM_MB / 4))
+
+if [ "$HEAP_MB" -gt 8192 ]; then
+    HEAP_MB=8192
+fi
+
+HEAP_NEW_MB=$((HEAP_MB / 5))
+
+log "RAM: ${RAM_MB}M"
+log "Cassandra heap: ${HEAP_MB}M"
+log "New generation heap: ${HEAP_NEW_MB}M"
 
 log "Пишу конфигурацию"
+
+mkdir -p /opt/cassandra
+
 cat > /opt/cassandra/docker-compose.yml <<'COMPOSE'
 services:
   cassandra:
@@ -103,20 +158,64 @@ HEAP_SIZE=${HEAP_MB}M
 HEAP_NEW=${HEAP_NEW_MB}M
 ENV
 
-log "Запускаю контейнер"
+log "Проверяю Docker Compose"
+
 cd /opt/cassandra
+
+docker compose config > /dev/null
+
+log "Запускаю Cassandra"
+
 docker compose up -d
 
-log "Жду перехода в NORMAL"
-DEADLINE=$(( SECONDS + 3600 ))
-while [ $SECONDS -lt $DEADLINE ]; do
-    if docker exec cassandra nodetool netstats 2>/dev/null | head -1 | grep -q "Mode: NORMAL"; then
-        log "Готово, нода в NORMAL"
-        docker exec cassandra nodetool status
-        exit 0
+log "Жду запуска Cassandra"
+
+DEADLINE=$((SECONDS + 3600))
+
+while [ "$SECONDS" -lt "$DEADLINE" ]; do
+
+    if ! docker ps --format '{{.Names}}' | grep -qx cassandra; then
+        log "Контейнер Cassandra не запущен"
+        docker ps -a --filter name=cassandra
+        docker logs --tail 30 cassandra || true
+        exit 1
     fi
+
+    if docker exec cassandra nodetool status >/tmp/cassandra_status 2>/dev/null; then
+
+        if grep -qE "UN[[:space:]]+$NODE_IP[[:space:]]" /tmp/cassandra_status; then
+
+            log "Готово! Нода $NODE_IP находится в состоянии NORMAL"
+
+            cat /tmp/cassandra_status
+
+            exit 0
+        fi
+
+        log "Cassandra запущена, но нода ещё не NORMAL"
+
+    else
+
+        log "Cassandra ещё инициализируется..."
+
+    fi
+
     sleep 15
+
 done
 
-log "Не дождались NORMAL за час, проверь вручную: docker exec cassandra nodetool status"
+log "Не дождались NORMAL за час"
+
+echo
+echo "===== Cassandra status ====="
+docker exec cassandra nodetool status || true
+
+echo
+echo "===== Cassandra logs ====="
+docker logs --tail 100 cassandra || true
+
+echo
+echo "Проверь подключение к seed-нодам:"
+echo "$SEEDS"
+
 exit 1
