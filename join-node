@@ -1,7 +1,5 @@
 #!/bin/bash
 # join-node.sh
-# Использование: ./join-node.sh [IP_этой_ноды]
-# Если IP не передан, определяется автоматически
 
 set -euo pipefail
 
