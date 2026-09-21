@@ -1,253 +1,139 @@
-#!/usr/bin/env bash
+#!/bin/bash
+# join-node.sh
+# Использование: ./join-node.sh [IP_этой_ноды]
+# Если IP не передан, определяется автоматически
 
 set -euo pipefail
 
 CLUSTER_NAME="MainDC"
 DC="DC1"
 RACK="RACK1"
-SEEDS="192.168.1.164,192.168.1.165"
 
-DATA_DIR="/opt/cassandra/data"
-BACKUP_DIR="/opt/cassandra/backups"
-COMPOSE_FILE="/opt/cassandra/docker-compose.yml"
-ENV_FILE="/opt/cassandra/.env"
+KNOWN_NODES=(
+    192.168.1.164
+    192.168.1.165
+    192.168.1.171
+    192.168.1.178
+    192.168.1.109
+)
 
-log() {
-    echo "[$(date +%H:%M:%S)] $*"
-}
-
-error() {
-    echo
-    echo "ERROR: $*"
-    echo
-}
+log() { echo "[$(date +%H:%M:%S)] $*"; }
 
 if [ "$(id -u)" -ne 0 ]; then
-    error "Запускать скрипт нужно от root"
+    echo "Запускать от root"
     exit 1
 fi
 
 NODE_IP="${1:-}"
-
 if [ -z "$NODE_IP" ]; then
-    NODE_IP=$(
-        ip -4 -o addr show scope global |
-        grep -v docker |
-        awk '{print $4}' |
-        cut -d/ -f1 |
-        head -1
-    )
+    NODE_IP=$(ip -4 -o addr show scope global | grep -v docker | awk '{print $4}' | cut -d/ -f1 | head -1)
 fi
-
 if [ -z "$NODE_IP" ]; then
-    error "Не удалось определить IP.
-
-Передай IP первым аргументом:
-
-    $0 192.168.1.166"
-
+    echo "Не удалось определить IP, передай его первым аргументом"
     exit 1
 fi
-
 log "IP ноды: $NODE_IP"
 
-if ! ip -4 addr | grep -qw "$NODE_IP"; then
-    error "IP $NODE_IP не назначен этому серверу"
+log "Ищу живые ноды среди известных: ${KNOWN_NODES[*]}"
+LIVE_NODES=()
+for host in "${KNOWN_NODES[@]}"; do
+    if [ "$host" = "$NODE_IP" ]; then
+        continue
+    fi
+    log "Проверяю $host:7000"
+    if timeout 3 bash -c "echo > /dev/tcp/$host/7000" 2>/dev/null; then
+        log "$host:7000 OK"
+        LIVE_NODES+=("$host")
+    else
+        log "$host:7000 недоступен, пропускаю"
+    fi
+done
+
+if [ ${#LIVE_NODES[@]} -eq 0 ]; then
+    echo "Ни одна известная нода не отвечает на порту 7000."
+    echo "Присоединиться некуда: либо весь кластер лёг, либо это первая нода кластера."
+    echo "Если это первая нода нового кластера, укажи SEEDS вручную и стартуй без этого скрипта."
     exit 1
 fi
 
+# Двух живых достаточно для seeds, остальные не нужны в самом конфиге ноды.
+# Но проверяем по всему известному списку, чтобы не зависеть от конкретных двух адресов.
+SEEDS=$(printf "%s," "${LIVE_NODES[@]:0:2}")
+SEEDS="${SEEDS%,}"
+log "Использую seeds: $SEEDS"
+
 log "Отключаю swap"
-
-swapoff -a || true
-
-sed -i '/[[:space:]]swap[[:space:]]/ s/^/#/' /etc/fstab
+swapoff -a
+sed -i '/ swap / s/^/#/' /etc/fstab
 
 log "Настраиваю sysctl"
-
 tee /etc/sysctl.d/99-cassandra.conf > /dev/null <<'SYSCTL'
 vm.max_map_count = 1048575
 vm.swappiness = 1
 net.ipv4.tcp_keepalive_time = 300
 SYSCTL
-
 sysctl -p /etc/sysctl.d/99-cassandra.conf > /dev/null
 
 log "Настраиваю время"
-
 export DEBIAN_FRONTEND=noninteractive
-
 apt update -qq
-
 timedatectl set-timezone UTC
-
 apt install -y -qq systemd-timesyncd
-
 systemctl enable --now systemd-timesyncd
 
-if ! command -v docker >/dev/null 2>&1; then
+log "Готовлю каталог данных"
+mkdir -p /opt/cassandra/data
+chown -R 999:999 /opt/cassandra/data
 
+if ! command -v docker &> /dev/null; then
     log "Устанавливаю Docker"
-
     apt install -y -qq ca-certificates curl gnupg
-
     install -m 0755 -d /etc/apt/keyrings
-
-    curl -fsSL https://download.docker.com/linux/debian/gpg |
-        gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-
+    curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
     chmod a+r /etc/apt/keyrings/docker.gpg
-
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" |
-        tee /etc/apt/sources.list.d/docker.list > /dev/null
-
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
     apt update -qq
-
-    apt install -y -qq \
-        docker-ce \
-        docker-ce-cli \
-        containerd.io \
-        docker-compose-plugin
-
+    apt install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
     systemctl enable --now docker
-
 else
-
     log "Docker уже установлен"
-
 fi
-
-log "Готовлю каталоги"
-
-mkdir -p /opt/cassandra
-mkdir -p "$BACKUP_DIR"
-
-if docker ps -a --format '{{.Names}}' | grep -qx cassandra; then
-
-    log "Обнаружен существующий контейнер Cassandra"
-
-    # Отключаем автоматический restart,
-    # чтобы неисправная нода не ушла в бесконечный restart loop.
-    docker update --restart=no cassandra >/dev/null 2>&1 || true
-
-    if docker inspect cassandra --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
-        log "Останавливаю старый контейнер"
-        docker stop cassandra >/dev/null
-    fi
-
-    log "Удаляю старый контейнер Cassandra"
-
-    docker rm cassandra >/dev/null
-fi
-
-mkdir -p "$DATA_DIR"
-
-if find "$DATA_DIR" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
-
-    error "Каталог $DATA_DIR НЕ ПУСТОЙ.
-
-Это новая Cassandra-нода, поэтому запуск поверх существующих
-данных запрещён.
-
-Если это остатки старой неудачной установки, сначала сохрани их
-в backup и очисти каталог."
-
-    echo "Содержимое:"
-    find "$DATA_DIR" -mindepth 1 -maxdepth 2 -print | head -50
-
-    echo
-    echo "Если это действительно старая нода, можно выполнить:"
-    echo
-    echo "    mv $DATA_DIR ${BACKUP_DIR}/data_\$(date +%Y%m%d_%H%M%S)"
-    echo "    mkdir -p $DATA_DIR"
-    echo "    chown -R 999:999 $DATA_DIR"
-    echo
-    echo "После этого запусти скрипт повторно."
-
-    exit 1
-fi
-
-chown -R 999:999 "$DATA_DIR"
 
 RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
+HEAP_MB=$(( RAM_MB / 4 ))
+[ $HEAP_MB -gt 8192 ] && HEAP_MB=8192
+HEAP_NEW_MB=$(( HEAP_MB / 5 ))
+log "RAM ${RAM_MB}M, heap ${HEAP_MB}M"
 
-if [ -z "$RAM_MB" ] || [ "$RAM_MB" -le 0 ]; then
-    error "Не удалось определить объём RAM"
-    exit 1
-fi
-
-HEAP_MB=$((RAM_MB / 4))
-
-if [ "$HEAP_MB" -lt 512 ]; then
-    HEAP_MB=512
-fi
-
-if [ "$HEAP_MB" -gt 8192 ]; then
-    HEAP_MB=8192
-fi
-
-HEAP_NEW_MB=$((HEAP_MB / 5))
-
-log "RAM: ${RAM_MB}M"
-log "Cassandra heap: ${HEAP_MB}M"
-log "New generation heap: ${HEAP_NEW_MB}M"
-
-log "Проверяю доступность seed-нод"
-
-IFS=',' read -ra SEED_ARRAY <<< "$SEEDS"
-
-for SEED in "${SEED_ARRAY[@]}"; do
-
-    log "Проверяю $SEED:7000"
-
-    if timeout 3 bash -c "</dev/tcp/$SEED/7000"; then
-        log "$SEED:7000 OK"
-    else
-        error "$SEED:7000 недоступен"
-        exit 1
-    fi
-
-done
-
-log "Пишу Docker Compose"
-
-cat > "$COMPOSE_FILE" <<'COMPOSE'
+log "Пишу конфигурацию"
+cat > /opt/cassandra/docker-compose.yml <<'COMPOSE'
 services:
-
   cassandra:
     image: cassandra:4.1
     container_name: cassandra
     restart: unless-stopped
-
     network_mode: host
-
     environment:
       CASSANDRA_CLUSTER_NAME: ${CLUSTER_NAME}
       CASSANDRA_DC: ${DC}
       CASSANDRA_RACK: ${RACK}
-
       CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
-
       CASSANDRA_SEEDS: ${SEEDS}
-
       CASSANDRA_LISTEN_ADDRESS: ${NODE_IP}
       CASSANDRA_BROADCAST_ADDRESS: ${NODE_IP}
-
       CASSANDRA_RPC_ADDRESS: ${NODE_IP}
       CASSANDRA_BROADCAST_RPC_ADDRESS: ${NODE_IP}
-
       MAX_HEAP_SIZE: ${HEAP_SIZE}
       HEAP_NEWSIZE: ${HEAP_NEW}
-
     volumes:
       - /opt/cassandra/data:/var/lib/cassandra
-
     ulimits:
       memlock: -1
       nofile: 100000
       nproc: 32768
 COMPOSE
 
-cat > "$ENV_FILE" <<ENV
+cat > /opt/cassandra/.env <<ENV
 NODE_IP=${NODE_IP}
 CLUSTER_NAME=${CLUSTER_NAME}
 DC=${DC}
@@ -257,93 +143,20 @@ HEAP_SIZE=${HEAP_MB}M
 HEAP_NEW=${HEAP_NEW_MB}M
 ENV
 
+log "Запускаю контейнер"
 cd /opt/cassandra
-
-log "Проверяю Docker Compose"
-
-docker compose config > /dev/null
-
-log "Запускаю Cassandra"
-
 docker compose up -d
 
-log "Жду запуска Cassandra"
-
-DEADLINE=$((SECONDS + 3600))
-JMX_REPORTED=false
-
-while [ "$SECONDS" -lt "$DEADLINE" ]; do
-
-    if ! docker ps --format '{{.Names}}' | grep -qx cassandra; then
-
-        error "Контейнер Cassandra остановился"
-
-        echo "===== Container ====="
-        docker ps -a --filter name=cassandra
-
-        echo
-        echo "===== Logs ====="
-        docker logs --tail 100 cassandra || true
-
-        exit 1
+log "Жду перехода в NORMAL"
+DEADLINE=$(( SECONDS + 3600 ))
+while [ $SECONDS -lt $DEADLINE ]; do
+    if docker exec cassandra nodetool netstats 2>/dev/null | head -1 | grep -q "Mode: NORMAL"; then
+        log "Готово, нода в NORMAL"
+        docker exec cassandra nodetool status
+        exit 0
     fi
-
-    if docker exec cassandra nodetool info >/tmp/cassandra_info 2>/dev/null; then
-
-        if [ "$JMX_REPORTED" = false ]; then
-            log "JMX Cassandra доступен"
-            JMX_REPORTED=true
-        fi
-
-        if docker exec cassandra nodetool status >/tmp/cassandra_status 2>/dev/null; then
-
-            if grep -qE "UJ[[:space:]]+$NODE_IP[[:space:]]" /tmp/cassandra_status; then
-                log "Нода $NODE_IP находится в состоянии JOINING"
-                log "Bootstrap продолжается..."
-            fi
-
-            if grep -qE "UN[[:space:]]+$NODE_IP[[:space:]]" /tmp/cassandra_status; then
-
-                log "=========================================="
-                log "Готово!"
-                log "Нода $NODE_IP находится в состоянии NORMAL"
-                log "=========================================="
-
-                cat /tmp/cassandra_status
-
-                exit 0
-            fi
-
-        fi
-
-    else
-
-        log "Cassandra ещё инициализируется..."
-
-    fi
-
     sleep 15
-
 done
 
-error "Не дождались NORMAL за 1 час"
-
-echo
-echo "===== Cassandra status ====="
-docker exec cassandra nodetool status || true
-
-echo
-echo "===== Cassandra info ====="
-docker exec cassandra nodetool info || true
-
-echo
-echo "===== Cassandra logs ====="
-docker logs --tail 150 cassandra || true
-
-echo
-echo "===== Container state ====="
-docker inspect cassandra \
-    --format 'Status={{.State.Status}} Running={{.State.Running}} RestartCount={{.RestartCount}} ExitCode={{.State.ExitCode}}' \
-    || true
-
+log "Не дождались NORMAL за час, проверь вручную: docker exec cassandra nodetool status"
 exit 1
